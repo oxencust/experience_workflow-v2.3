@@ -1414,8 +1414,12 @@
                         eventDate = eventDate.replace(/\//g, '-');
                     }
                     
-                    // ✅ 新增：去重檢查
-                    const uniqueKey = `${eventDate}_${event.startTime}_${event.endTime}`;
+                    // ✅ 先標準化時間格式（只取 HH:MM）
+                    const normalizedStartTime = event.startTime.substring(0, 5);
+                    const normalizedEndTime = event.endTime.substring(0, 5);
+                    
+                    // ✅ 用標準化後的格式去重
+                    const uniqueKey = `${eventDate}_${normalizedStartTime}_${normalizedEndTime}`;
                     if (seenKeys.has(uniqueKey)) {
                         console.warn(`⚠️ 跳過重複事件: ${uniqueKey}`);
                         return;
@@ -1441,8 +1445,8 @@
                     
                     processed[weekKey].push({
                         date: eventDate,
-                        startTime: event.startTime,
-                        endTime: event.endTime,
+                        startTime: normalizedStartTime,
+                        endTime: normalizedEndTime,
                         status: event.status || 'available',
                         eventId: event.eventId || event.id,
                         studentName: studentName,
