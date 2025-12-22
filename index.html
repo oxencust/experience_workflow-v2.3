@@ -2449,12 +2449,24 @@
         }
 
         function getWeekKey(date) {
-            return `${date.getFullYear()}-W${String(getWeekNumber(date)).padStart(2, '0')}`;
+            // ✅ 使用 ISO 週年，而不是日期的年份
+            const isoWeekYear = getISOWeekYear(date);
+            return `${isoWeekYear}-W${String(getWeekNumber(date)).padStart(2, '0')}`;
         }
 
         function getWeekKeyFromDate(dateStr) {
             const date = new Date(dateStr + 'T00:00:00');
             return getWeekKey(date);
+        }
+
+        // ✅ 新增：計算 ISO 週年（處理跨年問題）
+        function getISOWeekYear(date) {
+            const d = new Date(date);
+            d.setHours(0, 0, 0, 0);
+            // 調整到該週的週四
+            d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+            // 週四所在的年份就是 ISO 週年
+            return d.getFullYear();
         }
 
         function getWeekNumber(date) {
