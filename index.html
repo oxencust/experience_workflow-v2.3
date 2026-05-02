@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>教練排程系統 v2.3 去重修復版</title>
+    <title>教練體驗課排程系統</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700&display=swap');
         
@@ -1022,7 +1022,7 @@
             <div class="user-profile">
                 <div class="avatar" id="userAvatar">👤</div>
                 <div class="user-info">
-                    <div style="font-size: 10px; color: var(--text-light); letter-spacing: 0.5px; margin-bottom: 2px; text-transform: uppercase;">教練排程系統 v2.3 去重修復版</div>
+                    <div style="font-size: 10px; color: var(--text-light); letter-spacing: 0.5px; margin-bottom: 2px; text-transform: uppercase;">教練體驗課排程系統</div>
                     <h1 id="userName">教練姓名</h1>
                     <p id="userType">教練類型</p>
                 </div>
@@ -1219,12 +1219,57 @@
         }, { passive: false });
 
         const TEST_MODE = false;
-        const WEBHOOK_URL = 'https://hook.us2.make.com/ykptxvohkcxrbjf91s8uqggh2pfhtmr5';
-        const CALENDAR_LOAD_URL = 'https://hook.us2.make.com/ykptxvohkcxrbjf91s8uqggh2pfhtmr5';
+        const EDGE_FUNCTION_URL = 'https://mnjilhpztnowaplggvkk.supabase.co/functions/v1/booking-api';
         const PRELOAD_WEEKS = 10;
+
+        // Edge Function helper
+        async function callEdge(action, payload) {
+  // ── Sprint 0 Phase 1: 自動帶上 staffLineUid ──
+  let _uid = null;
+  try {
+    _uid = sessionStorage.getItem('staffLineUid');
+    if (!_uid) {
+      const _st = JSON.parse(sessionStorage.getItem('currentStaff') || 'null');
+      _uid = _st?.lineUid || _st?.line_id_edu || null;
+    }
+  } catch(e) {}
+  const _body = { action, ...(payload || {}) };
+  if (_uid && !_body.lineUid) _body.lineUid = _uid;
+
+            try {
+                const response = await fetch(EDGE_FUNCTION_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(_body)
+                });
+
+                if (!response.ok) {
+                    const errText = await response.text().catch(() => '');
+                    console.error(`callEdge(${action}) HTTP ${response.status}:`, errText);
+                    throw new Error(`HTTP ${response.status}: ${errText.substring(0, 200)}`);
+                }
+
+                const text = await response.text();
+                if (!text || text === 'Accepted' || text === 'OK' || text.trim() === '') {
+                    return null;
+                }
+
+                try {
+                    return JSON.parse(text);
+                } catch (e) {
+                    console.error('JSON parse error:', e, 'raw:', text.substring(0, 300));
+                    return null;
+                }
+            } catch (error) {
+                console.error(`callEdge(${action}) error:`, error);
+                throw error;
+            }
+        }
         
         let currentTeacher = '';
         let currentTeacherType = '';
+        let currentCoachId = '';        // 教練編號（HD26xxxxx）
+        let currentCoachNickname = '';   // 教練顯示名稱（從 API 取得）
         let currentWeekStart = new Date();
         let currentWeekEnd = new Date();
         let calendarData = {};
@@ -1327,51 +1372,56 @@
                     showToast('✅ 測試模式');
                     return;
                 }
-                
-                const response = await fetch(CALENDAR_LOAD_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        action: 'load',
-                        userId: currentTeacher,
-                        coachType: currentTeacherType,
+
+                console.log('🗑️ 清空所有資料');
+                calendarData = {};
+                pendingChanges = {};
+                resetStats();
+
+                // ── 從 Supabase trial_slots 讀取 ──
+                let uniqueEvents = [];
+                try {
+                    console.log('📅 從 Supabase trial_slots 載入...');
+                    const queryParams = currentCoachId
+                        ? { coachId: currentCoachId }
+                        : { userId: currentTeacher, coachType: currentTeacherType };
+                    const dbData = await callEdge('getCoachSchedule', {
+                        ...queryParams,
                         startDate: formatDate(startDate),
                         endDate: formatDate(endDate)
-                    })
+                    });
+                    if (dbData) {
+                        // 補回 coachId（防止 getUserInfo 查不到的情況）
+                        if (!currentCoachId && dbData.coach?.id) {
+                            currentCoachId = dbData.coach.id;
+                            console.log('✅ loadFromCalendar 補回 coachId:', currentCoachId);
+                        }
+                        const dbEvents = dbData?.events || dbData?.schedules || dbData?.slots || [];
+                        uniqueEvents = dbEvents.map(s => s.slot_date && !s.date
+                            ? { ...s, date: s.slot_date, startTime: s.start_time, endTime: s.end_time }
+                            : s
+                        );
+                        console.log(`📅 trial_slots: ${uniqueEvents.length} 筆`);
+                    }
+                } catch (e) {
+                    console.error('❌ trial_slots 載入失敗:', e.message);
+                    showToast('❌ 載入失敗，請稍後重試', 4000);
+                }
+
+                if (uniqueEvents.length === 0) {
+                    console.log('✅ 載入完成 (無資料)');
+                    showToast('✅ 載入完成 (目前無排程)');
+                    return;
+                }
+
+                const newData = processCalendarData({ events: uniqueEvents });
+                Object.keys(newData).forEach(weekKey => {
+                    calendarData[weekKey] = newData[weekKey];
                 });
 
-                if (response.ok) {
-                    const responseText = await response.text();
-                    
-                    console.log('🗑️ 清空所有資料');
-                    calendarData = {};
-                    pendingChanges = {};
-                    resetStats();
-                    
-                    if (!responseText || responseText === 'Accepted' || responseText === 'OK' || responseText.trim() === '') {
-                        console.log('✅ 載入完成 (無資料)');
-                        showToast('✅ 載入完成 (目前無排程)');
-                        return;
-                    }
-                    
-                    let data;
-                    try {
-                        data = JSON.parse(responseText);
-                    } catch (e) {
-                        console.error('❌ JSON解析失敗:', e);
-                        showToast('❌ 資料格式錯誤');
-                        return;
-                    }
-                    
-                    const newData = processCalendarData(data);
-                    Object.keys(newData).forEach(weekKey => {
-                        calendarData[weekKey] = newData[weekKey];
-                    });
-                    
-                    const totalEvents = Object.values(calendarData).reduce((sum, arr) => sum + arr.length, 0);
-                    console.log(`✅ 載入 ${totalEvents} 個時段`);
-                    showToast(`✅ 載入 ${totalEvents} 個時段`);
-                }
+                const totalEvents = Object.values(calendarData).reduce((sum, arr) => sum + arr.length, 0);
+                console.log(`✅ 載入 ${totalEvents} 個時段（舊+新合併）`);
+                showToast(`✅ 載入 ${totalEvents} 個時段`);
             } catch (error) {
                 console.error('❌ 載入失敗:', error);
                 calendarData = {};
@@ -1383,7 +1433,12 @@
 
         function processCalendarData(data) {
             const processed = {};
-            const eventList = data?.events || data?.schedules || [];
+            // 相容 events / schedules / slots（booking-api 回傳 slots）
+            let eventList = data?.events || data?.schedules || data?.slots || [];
+            // 如果是 trial_slots 原始格式（slot_date/start_time），自動轉換
+            if (eventList.length > 0 && eventList[0].slot_date && !eventList[0].date) {
+                eventList = eventList.map(s => ({ ...s, date: s.slot_date, startTime: s.start_time, endTime: s.end_time }));
+            }
             
             console.log(`📋 原始資料: ${eventList.length} 個事件`);
             
@@ -2102,8 +2157,13 @@
                 console.warn('⚠️ 以下刪除操作缺少 eventId:', missingEventIds);
             }
             
+            if (!currentCoachId) {
+                showToast('❌ 無法辨識教練身份，請重新載入頁面', 4000);
+                return;
+            }
+
             isSaving = true;
-            
+
             const confirmBtn = document.getElementById('confirmSaveBtn');
             const originalText = confirmBtn ? confirmBtn.textContent : '確認送出';
             if (confirmBtn) {
@@ -2117,58 +2177,58 @@
             showToast(`📤 送出 ${allChanges.length} 個時段...`);
             
             try {
-                const response = await fetch(WEBHOOK_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        action: 'save',
-                        userId: currentTeacher,
-                        userName: currentTeacher,
-                        coachType: currentTeacherType,
-                        timestamp: new Date().toISOString(),
-                        changes: allChanges.map(c => {
-                            const endTimeInfo = calculateEndTimeAndDate(c.date, c.startTime, c.duration || 60);
-                            
-                            return {
-                                action: c.action,
-                                date: c.date,
-                                startTime: c.startTime,
-                                endTime: endTimeInfo.endTime,
-                                endDate: endTimeInfo.endDate,
-                                isCrossDay: endTimeInfo.isCrossDay,
-                                dayName: c.dayLabel,
-                                startDateTime: `${c.date} ${c.startTime}`,
-                                endDateTime: endTimeInfo.endDateTime,
-                                eventId: c.eventId || null
-                            };
-                        })
-                    })
+                // 準備 changes 資料（共用）
+                const mappedChanges = allChanges.map(c => {
+                    const endTimeInfo = calculateEndTimeAndDate(c.date, c.startTime, c.duration || 60);
+                    return {
+                        action: c.action,
+                        date: c.date,
+                        startTime: c.startTime,
+                        endTime: endTimeInfo.endTime,
+                        endDate: endTimeInfo.endDate,
+                        isCrossDay: endTimeInfo.isCrossDay,
+                        dayName: c.dayLabel,
+                        startDateTime: `${c.date} ${c.startTime}`,
+                        endDateTime: endTimeInfo.endDateTime,
+                        eventId: c.eventId || null
+                    };
                 });
-                
-                if (response.ok) {
-                    console.log('✅ 送出成功');
-                    
+
+                // ── 寫入 Supabase trial_slots ──
+                const result = await callEdge('saveSlots', {
+                    coachId: currentCoachId,
+                    coachName: currentTeacher,
+                    coachType: currentTeacherType,
+                    changes: mappedChanges
+                });
+
+                if (result?.success) {
+                    console.log('✅ trial_slots 寫入成功');
+
                     pendingChanges = {};
                     await loadFromCalendar();
                     generateCalendar();
                     updateStats();
                     updateSaveStatus();
-                    
+
                     showToast(`🎉 已送出 ${allChanges.length} 個時段!`);
-                    
+
                     setTimeout(() => {
                         location.reload();
                     }, 2000);
-                    
+
                 } else {
-                    throw new Error(`HTTP ${response.status}`);
+                    const detail = result?.errors ? result.errors.join('; ') : (result?.error || '寫入失敗');
+                    console.error('❌ saveSlots 失敗:', JSON.stringify(result));
+                    throw new Error(detail);
                 }
-                
+
             } catch (error) {
                 console.error('❌ 送出錯誤:', error);
-                showToast('❌ 送出失敗,請稍後重試', 4000);
-                
-                if (confirm('送出失敗,是否要重新載入頁面以確保資料一致性?')) {
+                const errMsg = error?.message || String(error);
+                showToast(`❌ 送出失敗: ${errMsg.substring(0, 100)}`, 6000);
+
+                if (confirm(`送出失敗: ${errMsg.substring(0, 150)}\n\n是否要重新載入頁面以確保資料一致性?`)) {
                     location.reload();
                 }
             } finally {
@@ -2399,12 +2459,49 @@
             updateSaveStatus();
         }
 
-        function getUserInfo() {
+        async function getUserInfo() {
             const params = new URLSearchParams(window.location.search);
-            currentTeacher = params.get('userId') || params.get('teacher') || params.get('coach') || 'test-coach';
-            currentTeacherType = params.get('type') || 'pilates';
-            document.getElementById('userName').textContent = currentTeacher;
-            document.getElementById('userType').textContent = currentTeacherType;
+            // 優先用 coachId（新流程），向下相容舊參數
+            currentCoachId = params.get('coach_id') || params.get('coachId') || '';
+            currentTeacher = params.get('userId') || params.get('teacher') || params.get('coach') || params.get('name') || '';
+            currentTeacherType = params.get('type') || params.get('coach_type') || '';
+
+            // 從 API 取得教練完整資訊（名稱、課種、ID）
+            try {
+                const queryParams = currentCoachId
+                    ? { coachId: currentCoachId }
+                    : currentTeacher
+                        ? { userId: currentTeacher, coachType: currentTeacherType }
+                        : null;
+                if (queryParams) {
+                    const coachRes = await callEdge('getCoachSchedule', queryParams);
+                    if (coachRes?.success && coachRes.coach) {
+                        const coach = coachRes.coach;
+                        if (!currentCoachId && coach.id) {
+                            currentCoachId = coach.id;
+                            console.log('✅ 從 API 取得 coachId:', currentCoachId);
+                        }
+                        currentCoachNickname = coach.name || coach.nickname || currentTeacher;
+                        currentTeacher = currentCoachNickname;
+                        currentTeacherType = coach.coach_type || currentTeacherType;
+                    }
+                }
+            } catch (e) {
+                console.warn('⚠️ 查詢教練失敗:', e.message);
+            }
+
+            // 顯示教練名稱（首字母大寫已在 DB nickname 處理）
+            document.getElementById('userName').textContent = currentTeacher || 'test-coach';
+
+            // 顯示課種中文名稱
+            const TYPE_DISPLAY = {
+                'ai_analysis': 'AI 3D體態分析',
+                'pilates': '皮拉提斯',
+                'stretch': '肌肉賦能伸展',
+                'strength_training': '重訓',
+                'stretching': '肌肉賦能伸展'
+            };
+            document.getElementById('userType').textContent = TYPE_DISPLAY[currentTeacherType] || currentTeacherType;
             document.getElementById('userAvatar').textContent = getCoachTypeIcon(currentTeacherType);
         }
         
@@ -2413,13 +2510,16 @@
                 'ai_analysis': '🤖',
                 'aianalysis': '🤖',
                 'pilates': '🧘',
+                'stretch': '🤸',
+                'stretching': '🤸',
                 'strength_training': '💪',
                 'strengthtraining': '💪',
-                'stretching': '🤸',
                 'AI分析': '🤖',
                 'ai分析': '🤖',
+                'AI 3D體態分析': '🤖',
                 '皮拉提斯': '🧘',
                 '重訓': '💪',
+                '肌肉賦能伸展': '🤸',
                 '伸展': '🤸'
             };
             
